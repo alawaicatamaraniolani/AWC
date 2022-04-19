@@ -25,23 +25,35 @@
    void os_getDevEui (u1_t* buf) { }
    void os_getDevKey (u1_t* buf) { }
 */
-
-#include <TinyGPS.h>
+#include <NMEAGPS.h>
+#include <GPSport.h>
+#include <Streamers.h>
 #include <ping1d.h>
 #include <lmic.h>
 #include <hal/hal.h>
 #include <SD.h>
 #include <SPI.h>
 #include <Wire.h>
+#include <Watchdog.h>
+#include <MS5837.h>
 
-//---------Tiny GPS vars-------------
-static void smartdelay(unsigned long ms);
-TinyGPS gps;
-unsigned long fix_age2, timeGPS2;
-long lat, lon;
-//-----------------------------------
+//----------Pressure-Vars-----------
+MS5837 pressure;
+//----------------------------------
 
-//==============Atlas Sensor Vars===============
+//----------Watchdog-Vars-----------
+Watchdog watchdog;
+boolean reseted = false;
+//----------------------------------
+
+//----------Neo-GPS-Vars------------
+static NMEAGPS  gps;
+static gps_fix  fix;
+long int latit,longi = 0;
+float date = 0;
+//----------------------------------
+
+//--------Atlas-Sensor-Vars---------
 char sensordata[30];                  // A 30 byte character array to hold incoming data from the sensors
 byte sensor_bytes_received = 0;       // We need to know how many characters bytes have been received
 byte in_char = 0;                     // used as a 1 byte buffer to store in bound bytes from the I2C Circuit.
@@ -51,30 +63,29 @@ byte in_char = 0;                     // used as a 1 byte buffer to store in bou
 int channel_ids[] = {97, 99, 100, 102}; // A list of I2C ids that you set your circuits to.
 char *channel_names[] = {"DO", "PH", "EC", "TP"}; // A list of channel names (must be the same order as in channel_ids[])
 
-//------------encapsulation definitions-----------------------
-#define numberOfValues 8
-#define bitSum 17+15+18+17+28+29+15+7  //must manualy enter all values due to the way that C++ accesses memory
-#define packetLen (int)(ceil((float)(bitSum)/8))
-// the order of sensors: temp, pH, cond, oxy, lat, lon, depth, confidence
-int bitLen[] = {17,15,18,17,28,29,15,7};
-long int bitVal[numberOfValues];
-uint8_t packets[packetLen]; 
-int oldbit;
-int bitCounter;
-byte state;
-
-//------------------------------------------------------------
 //variables for holding the data from the atlas sensors
 float temp = 0;
 float pH = 0;
 long int cond = 0;
 float oxy = 0;
+//----------------------------------
 
-//-----------------------------------------
+//-------Encapsulation-Vars---------
+#define numberOfValues 9
+#define bitSum 17+15+18+17+28+29+15+15+10  //must manualy enter all values due to the way that C++ accesses memory
+#define packetLen (int)((float)(bitSum-1)/8)+1
+// the order of sensors: temp, pH, cond, oxy, lat, lon, depth, confidence
+int bitLen[] = {17,15,18,17,28,29,15,15,10};
+long int bitVal[numberOfValues];
+uint8_t packets[packetLen]; 
+int oldbit;
+int bitCounter;
+byte state;
+//----------------------------------
 
-//------------LoRaWAN/LMIC vars---------------
+//--------LoRaWAN/LMIC-Vars---------
 //define the frequency the SPI bus will communcate on
-#define LMIC_SPI_FREQ 10000000
+#define LMIC_SPI_FREQ 1000000
 
 // LoRaWAN NwkSKey, network session key
 // This should be in big-endian (aka msb).
@@ -93,11 +104,8 @@ static const u1_t PROGMEM APPSKEY[16] = { 0xC3, 0xCC, 0xA7, 0x0D, 0x23, 0xA5, 0x
 static const u4_t DEVADDR = 0x260C1BE6 ; // <-- Change this address for every node!
 
 static osjob_t sendjob;
-//---------------------------------------
 
-//-------------teensy Pinout---------------
-
-// Pin mapping for Teenst 
+// Pin mapping for Teensy
 const lmic_pinmap lmic_pins = {
   .nss = 10, // chip select on CS (must be 5)
   .rxtx = LMIC_UNUSED_PIN,
@@ -105,20 +113,20 @@ const lmic_pinmap lmic_pins = {
   .dio = {22, 23, LMIC_UNUSED_PIN}, 
   // DIO Pins (can also be connected to any I/O pin, should not be connected to 12-15)
 };
-//----------------------------------------------
 
+// Schedule TX every this many seconds (might become longer due to duty
+// cycle limitations).
+const unsigned TX_INTERVAL = 3;
+//----------------------------------
 
-//-----------------ping variables-----------------
+//------------Ping-Vars-------------
 static Ping1D ping { Serial4 }; //defines the serial communication line for ping
 
 int dist = 0;
 int conf = 0;
-//------------------------------------------------
-// Schedule TX every this many seconds (might become longer due to duty
-// cycle limitations).
-const unsigned TX_INTERVAL = 3;
+//----------------------------------
 
-//-------------------SD Card---------------------
+//-------------SD-Vars--------------
 //SD card
 #define fileDir "sensors"
 #define fileName "loggingdata"
@@ -126,9 +134,164 @@ char fileNameChar[sizeof(fileName) - 1 + sizeof(fileDir) -1 + 8];
 int fileNum = 0;
 bool newname = true;
 bool logging = false;
-//----------------------------------------------
+//----------------------------------
 
-//---------------LoRa/MCCI function----------------
+//===================SETUP=======================
+void setup()
+{
+  pinMode(24,INPUT);
+  //Begin communications
+  Serial.println("Starting...");
+  Serial.begin(115200);
+  Serial4.begin(115200); //start ping communication
+  if(!ping.initialize())
+  {
+    Serial.println("Ping sonar not properly connected");
+  }
+  Wire.setSDA(34);
+  Wire.setSCL(33);
+  Wire.begin();
+  // if(!pressure.init())
+  // {
+  //   Serial.println("Pressure sensor not properly connected");
+  // }
+  SPI.setMOSI(11);
+  SPI.setMISO(12);
+  SPI.setSCK(27);
+  Serial.print("Initializing SD card...");
+  // see if the card is present and can be initialized:
+  if (!SD.begin(BUILTIN_SDCARD)) {
+    Serial.println("Card failed, or not present");
+  }
+  else
+  {
+    Serial.println("card initialized.");
+    logging = true;
+    //intialize SD Card name
+    String FILENAME = String(fileDir) + "/" + String(fileName) + "000.csv";
+    for(int i = 0; i < FILENAME.length();i++)
+    {
+      fileNameChar[i] = FILENAME[i];
+    }
+    SDNew(); //Set a new directory (if neccessary)
+    
+  }
+  // pressure.setFluidDensity(997); // kg/m^3 (freshwater, 1029 for seawater)
+  if(watchdog.tripped())
+  {
+    reseted = true;
+  }
+  watchdog.enable(Watchdog::TIMEOUT_8S);
+
+  gpsPort.begin( 9600 );
+
+  os_init(); // LMIC init
+  LMIC_reset(); // Reset the MAC state. Session and pending data transfers will be discarded.
+
+  // Set static session parameters. Instead of dynamically establishing a session
+  // by joining the network, precomputed session parameters are to be provided.
+#ifdef PROGMEM
+  // On AVR, these values are stored in flash and only copied to RAM
+  // once. Copy them to a temporary buffer here, LMIC_setSession will
+  // copy them into a buffer of its own again.
+  uint8_t appskey[sizeof(APPSKEY)];
+  uint8_t nwkskey[sizeof(NWKSKEY)];
+  memcpy_P(appskey, APPSKEY, sizeof(APPSKEY));
+  memcpy_P(nwkskey, NWKSKEY, sizeof(NWKSKEY));
+  LMIC_setSession (0x13, DEVADDR, nwkskey, appskey);
+#else
+  // If not running an AVR with PROGMEM, just use the arrays directly
+  LMIC_setSession (0x13, DEVADDR, NWKSKEY, APPSKEY);
+#endif
+
+  LMIC_selectSubBand(1); //sets the region
+  LMIC_setDrTxpow(DR_SF7, 14); // Set data rate and transmit power for uplink
+
+  do_send(&sendjob); // Start job
+}
+//==================END=SETUP====================
+
+//====================LOOP=======================
+void loop() {
+  for (int Channel = 0; Channel < TOTAL_CIRCUITS; Channel++) {       // loop through all the sensors
+    if(reseted)
+    {
+      watchdog.reset();
+    }
+    Wire.beginTransmission(channel_ids[Channel]);     // call the circuit by its ID number.
+    Wire.write('r');                              // request a reading by sending 'r'
+    Wire.endTransmission();                            // end the I2C data transmission.
+    
+    for (unsigned long starting = millis(); millis() - starting < 1000;)
+    {
+      
+      while (gps.available(gpsPort))
+      {
+        char c = Serial1.read();
+        if (gps.available(gpsPort)) // Did a new valid sentence come in?
+        {
+          fix = gps.read();
+          doSomeWork();
+        }
+      }
+
+      if(digitalRead(24)==0)
+      {
+        watchdog.reset();
+      }
+    } 
+
+    sensor_bytes_received = 0;                        // reset data counter
+    memset(sensordata, 0, sizeof(sensordata));        // clear sensordata array;
+    Wire.requestFrom(channel_ids[Channel], 48, 1);    // call the circuit and request 48 bytes 
+
+    while (Wire.available()) {          // are there bytes to receive?
+      in_char = Wire.read();            // receive a byte.
+      if (in_char == 0) {               // null character indicates end of command
+        Wire.endTransmission();         // end the I2C data transmission.
+        break;                          // exit the while loop, we're done here
+      }
+      else {
+        sensordata[sensor_bytes_received] = in_char;      // append this byte to the sensor data array.
+        sensor_bytes_received++;
+      }
+    }
+    Serial.print(channel_names[Channel]);
+    Serial.print(":");
+    
+    for (int i = 0; i < 29; i++){
+      sensordata[i] = sensordata[i+1];
+    }
+    //assign sensor data to appropriate variables
+    switch (Channel) {
+      case 0:
+        cond = atof(sensordata);
+        bitVal[3] = (long int)(100 * atoi(sensordata));
+        Serial.println(cond,2);
+        break;
+      case 1:
+        pH = atof(sensordata);
+        bitVal[1] = (int)(atof(sensordata) * 1000);
+        Serial.println(pH,3);
+        break;
+      case 2:
+        oxy = atoi(sensordata);
+        bitVal[2] = (long int)atoi(sensordata);
+        Serial.println(oxy);
+        break;
+      case 3:
+        temp = atof(sensordata);
+        bitVal[0] = (int)(atof(sensordata) * 1000);
+        Serial.println(temp,3);
+        break;
+    }
+  } 
+  //should be called at least once in a while
+  os_runloop_once();
+}
+//===================END=LOOP====================
+
+//--------LoRa/MCCI-function--------
 void onEvent (ev_t ev) {
   switch (ev) {
     case EV_SCAN_TIMEOUT:
@@ -201,7 +364,9 @@ void onEvent (ev_t ev) {
       break;
   }
 }
+//----------------------------------
 
+//----------Lora-Transmit-----------
 //function for sending actual data over LoRa
 void do_send(osjob_t* j) {
   // Check if there is not a current TX/RX job running
@@ -214,275 +379,86 @@ void do_send(osjob_t* j) {
   }
   // Next TX is scheduled after TX_COMPLETE event.
 }
+//----------------------------------
 
-void GPSData(bool newData)
-{
-  unsigned long chars;
-  unsigned short sentences, failed;
-  if(newData)
+//--------Data-Encapsulate----------
+//Ecapsulates data to be sent over Lora
+uint8_t* encapsulate() {
+  int runningBitLen = bitLen[0];
+  int startBit = 0;
+  int packetNum = 0;
+  for(int i = 0; i < packetLen; i++)
   {
-    unsigned long age, fix_age, timeGPS, date, speedGPS, courseGPS;
-    
-    //pull data
-    gps.get_position(&lat, &lon, &age);
-    gps.get_datetime(&date, &timeGPS, &fix_age);
-    speedGPS = gps.speed();
-    uint32_t satel = gps.satellites();
-    int32_t hDOP = gps.hdop();
-
-    Serial.print("satel:");
-    Serial.print(satel);
-    Serial.print(" Real:");
-    Serial.println(gps.satellites());
-    Serial.print("hdop:");
-    Serial.print(hDOP);
-    Serial.print(" Real:");
-    Serial.println(gps.hdop());
-    
-    //format data
-    bitVal[4]= 0;
-    bitVal[5] = 0;
-    if(lat < 0)
+    state = 0;
+    do
     {
-      bitVal[4] = pow(2,27);
-    }
-    if(lon <0)
-    {
-      bitVal[5] = pow(2,28);
-    }
-    bitVal[4] += abs(lat);
-    bitVal[5] += abs(lon);
-    fix_age2 = fix_age;
-    timeGPS2 = timeGPS;
-    if(lat != 999999999)
-    {
-      Serial.print("Lat:");
-      Serial.print(lat);
-      Serial.print("  Lon:");
-      Serial.println(lon);
-    }
-  }
-  gps.stats(&chars, &sentences, &failed);
-  if (chars == 0)
-    Serial.println("** No characters received from GPS **");
-}
-
-void setup()
-{
-  //Begin communications
-  Serial.println("Starting...");
-  Serial.begin(115200);
-  Serial4.begin(115200); //start ping communication
-  if(!ping.initialize())
-  {
-    Serial.println("Ping sonar not properly connected");
-  }
-  Serial1.begin(9600);
-  delay(1000);
-  Wire.setSDA(34);
-  Wire.setSCL(33);
-  Wire.begin();
-  SPI.setMOSI(11);
-  SPI.setMISO(12);
-  SPI.setSCK(27);
-  Serial.print("Initializing SD card...");
-  // see if the card is present and can be initialized:
-  if (!SD.begin(BUILTIN_SDCARD)) {
-    Serial.println("Card failed, or not present");
-  }
-  else
-  {
-    Serial.println("card initialized.");
-    logging = true;
-    //intialize SD Card name
-    String FILENAME = String(fileDir) + "/" + String(fileName) + "000.csv";
-    for(int i = 0; i < FILENAME.length();i++)
-    {
-      fileNameChar[i] = FILENAME[i];
-    }
-    SDNew(); //Set a new directory (if neccessary)
-  }
-  
-  os_init(); // LMIC init
-  LMIC_reset(); // Reset the MAC state. Session and pending data transfers will be discarded.
-
-  // Set static session parameters. Instead of dynamically establishing a session
-  // by joining the network, precomputed session parameters are to be provided.
-#ifdef PROGMEM
-  // On AVR, these values are stored in flash and only copied to RAM
-  // once. Copy them to a temporary buffer here, LMIC_setSession will
-  // copy them into a buffer of its own again.
-  uint8_t appskey[sizeof(APPSKEY)];
-  uint8_t nwkskey[sizeof(NWKSKEY)];
-  memcpy_P(appskey, APPSKEY, sizeof(APPSKEY));
-  memcpy_P(nwkskey, NWKSKEY, sizeof(NWKSKEY));
-  LMIC_setSession (0x13, DEVADDR, nwkskey, appskey);
-#else
-  // If not running an AVR with PROGMEM, just use the arrays directly
-  LMIC_setSession (0x13, DEVADDR, NWKSKEY, APPSKEY);
-#endif
-
-  LMIC_selectSubBand(1); //sets the region
-  LMIC_setDrTxpow(DR_SF7, 14); // Set data rate and transmit power for uplink
-
-  do_send(&sendjob); // Start job
-}
-
-void loop() {
-  bool newData = true;
-  for (int Channel = 0; Channel < TOTAL_CIRCUITS; Channel++) {       // loop through all the sensors
-    Wire.beginTransmission(channel_ids[Channel]);     // call the circuit by its ID number.
-    Wire.write('r');                              // request a reading by sending 'r'
-    Wire.endTransmission();                            // end the I2C data transmission.
-    
-    bool osToggle = true;
-    for (unsigned long starting = millis(); millis() - starting < 1000;)
-    {
+      int shift = (runningBitLen%8 + startBit)+ 8*((runningBitLen/8)-1);
+      if(runningBitLen > 8)
+      {
+        state = state | (((abs(bitVal[packetNum]) & ((int)pow(2,(runningBitLen))-1))>> shift) & 255);
+      }
+      else
+      {
+        state = state | (((abs(bitVal[packetNum]) & ((int)pow(2,(runningBitLen))-1))<< (8-(startBit + runningBitLen%8))) & 255);
+      }
       
-      while (Serial1.available())
+      if(runningBitLen + startBit <= 8)
       {
-        char c = Serial1.read();
-        if (gps.encode(c)) // Did a new valid sentence come in?
+        packetNum++;
+        startBit = runningBitLen;
+        if(packetNum >= numberOfValues) 
         {
-          newData = true;
+          break;
         }
-      }
-      if(millis()%150 == 0) 
+        runningBitLen = bitLen[packetNum];
+      } 
+      else
       {
-        if((ping.update()))
-        {
-        dist = ping.distance();
-        conf = ping.confidence();
-        bitVal[6] = dist;
-        bitVal[7] = conf;
-        }
-        os_runloop_once();
-        if(logging)
-        {
-          SDSave();
-        }
-      }
-    }
-    GPSData(newData); 
-
-    sensor_bytes_received = 0;                        // reset data counter
-    memset(sensordata, 0, sizeof(sensordata));        // clear sensordata array;
-    Wire.requestFrom(channel_ids[Channel], 48, 1);    // call the circuit and request 48 bytes 
-
-    while (Wire.available()) {          // are there bytes to receive?
-      in_char = Wire.read();            // receive a byte.
-      if (in_char == 0) {               // null character indicates end of command
-        Wire.endTransmission();         // end the I2C data transmission.
-        break;                          // exit the while loop, we're done here
-      }
-      else {
-        sensordata[sensor_bytes_received] = in_char;      // append this byte to the sensor data array.
-        sensor_bytes_received++;
-      }
-    }
-    Serial.print(channel_names[Channel]);
-    Serial.print(":");
-    
-    for (int i = 0; i < 29; i++){
-      sensordata[i] = sensordata[i+1];
-    }
-    //assign sensor data to appropriate variables
-    switch (Channel) {
-      case 0:
-        oxy = atof(sensordata);
-        bitVal[3] = (long int)(100 * atoi(sensordata));
-        Serial.println(oxy,2);
+        runningBitLen = runningBitLen - (8- startBit);
+        startBit = 0;
         break;
-      case 1:
-        pH = atof(sensordata);
-        bitVal[1] = (int)(atof(sensordata) * 1000);
-        Serial.println(pH,3);
-        break;
-      case 2:
-        cond = atoi(sensordata);
-        bitVal[2] = (long int)atoi(sensordata);
-        Serial.println(cond);
-        break;
-      case 3:
-        temp = atof(sensordata);
-        bitVal[0] = (int)(atof(sensordata) * 1000);
-        Serial.println(temp,3);
-        break;
-    }
-  } // for loop
-  os_runloop_once();
-  
-  /*
-  //should be called at least once every so often to ensure that LoRaWAN
-  //still communicates correctly
-  */
-}
-
-
-//function that will translate data from all sensors to bits
-uint8_t* encapsulate()
-{
-  int runSum = 0;
-  int startNum;
-  int stopNum;
-  bitCounter =0;
-  for(int i = 0; i < numberOfValues;i++)
-  {
-    startNum = runSum;
-    stopNum = runSum - 1 + bitLen[i];
-    oldbit = bitLen[i];
-    int startPos = 0;
-    int binLength = 8 - startNum%8;
-    for(int bytes = 0; bytes < stopNum/8-startNum/8+1;bytes++)
-    {
-      if(oldbit < 9)
-      {
-        binLength = oldbit;
-        startPos = 8-oldbit;
       }
-      byteTransfer(bitVal[i],binLength,startPos);
-      packets[startNum/8 + bytes] = state;
-      startPos = 0;
-      binLength = 8;
-      if(bitCounter == 8)
-      {
-        for(int i2 = 0; i2< 8;i2++)
-        {
-          bitWrite(state,i2,0);
-        }
-        bitCounter = 0;
-      }
-    }
-    runSum += bitLen[i];
+    } while (true);
+    packets[i] = state;
+    // Serial.print("packet: ");
+    // Serial.println(i);
+    // Serial.print("hasvalue: ");
+    // for(int i2 = 0; i2<8;i2++)
+    // {
+    //   Serial.print(bitRead(packets[i],i2));
+    // }
+    // Serial.println();
   }
   return (uint8_t*)&packets;
 }
+//----------------------------------
 
-//function to transfer bits into bytes
-void byteTransfer(int reading, int i2, int buff)
-{
-  oldbit -= i2;
-  for (int i = 0; i < i2; i++)
-  {
-    bitWrite(state, i + buff, bitRead(reading, oldbit));
-    oldbit++;
-    bitCounter++;
-  }
-  oldbit -= i2;
-}
-
-//-------------------SD Save-------------------
+//-------------SD-Save--------------
 //prints current data readings to SD card
 void SDSave()
 {
   //log current data
 
   String dataString = "";
-  dataString += String(timeGPS2);
+  dataString += String(millis());
   dataString += ",";
-  dataString += String(lat);
+  dataString += String(fix.dateTime.day);
+  dataString += "-";
+  dataString += String(fix.dateTime.month);
+  dataString += "-";
+  dataString += String(fix.dateTime.year);
+  dataString += " ";
+  dataString += String(fix.dateTime.hours);
+  dataString += ":";
+  dataString += String(fix.dateTime.minutes);
+  dataString += ":";
+  dataString += String(fix.dateTime.seconds);
+  dataString += ".";
+  dataString += String(fix.dateTime_ms());
   dataString += ",";
-  dataString += String(lon);
+  dataString += String(fix.location.lat());
+  dataString += ",";
+  dataString += String(fix.location.lon());
   dataString += ",";
   dataString += String(temp,3);
   dataString += ",";
@@ -502,8 +478,7 @@ void SDSave()
     dataFile.println(dataString);
     dataFile.close();
   }
-//   if the file isn't open, pop up an error:
-  else 
+  else //if the file isn't open, pop up an error:
   {
     Serial.println("error opening .csv");
   }
@@ -540,6 +515,8 @@ void SDNew()
   
   // if the file is available, write to it:
   String nameString = "";
+  nameString += "Millis (ms)";
+  nameString += ",";
   nameString += "Time";
   nameString += ",";
   nameString += "Latitutde";
@@ -561,3 +538,52 @@ void SDNew()
   dataFile.println(nameString);
   dataFile.close();
  }
+//----------------------------------
+
+//----------Work-For-GPS------------
+static void doSomeWork()
+{
+  // Print all the things!
+  trace_all( DEBUG_PORT, gps, fix );
+  // watchdog.reset(); 
+  Serial.print("Laitutde:");
+  latit = fix.latitude()*1E7;
+  longi = fix.longitude()*1E7;
+  date = fix.dateTime_ms();
+  bitVal[4] =(int)(latit < 0 ? abs(latit) + pow(2,27) : abs(latit));
+  bitVal[5] =(int)(longi < 0 ? abs(longi) + pow(2,28) : abs(longi));
+  Serial.print("Time+Date: ");
+  Serial.print(date);
+  Serial.print(". latitude: ");
+  Serial.print(latit);
+  Serial.print("Second: ");
+  Serial.println(latit < 0 ? abs(latit) + pow(2,27) : abs(latit));
+  
+  if(latit==0)
+  {
+    watchdog.reset();
+  }
+
+  if((ping.update()))
+  {
+    dist = ping.distance();
+    conf = ping.confidence();
+    
+    Serial.print("depth:");
+    Serial.print(dist);
+    Serial.print(" Confidence: ");
+    Serial.println(conf);
+
+    bitVal[6] = dist;
+    bitVal[7] = conf;
+  }
+  
+  if(logging)
+  {
+    SDSave();
+  }
+  
+  os_runloop_once();
+
+} 
+//----------------------------------
